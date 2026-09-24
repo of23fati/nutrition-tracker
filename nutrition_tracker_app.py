@@ -153,9 +153,22 @@ MEAL_TYPES = {
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+
+    # ---- Пользователи ----
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            pin TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # ---- Таблицы данных (с user_id) ----
+    # Пользователи создаются только через регистрацию (пустой старт для нового друга)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
             date TEXT NOT NULL,
             product_name TEXT NOT NULL,
             barcode TEXT,
@@ -168,128 +181,221 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    try:
-        cur.execute("ALTER TABLE meals ADD COLUMN meal_type TEXT DEFAULT 'other'")
-    except sqlite3.OperationalError:
-        pass
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS favorites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_name TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            product_name TEXT NOT NULL,
             barcode TEXT,
             calories_100g REAL,
             proteins_100g REAL,
             fats_100g REAL,
             carbs_100g REAL,
             last_amount REAL DEFAULT 100,
-            times_used INTEGER DEFAULT 1
+            times_used INTEGER DEFAULT 1,
+            UNIQUE(user_id, product_name)
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
+            user_id INTEGER NOT NULL DEFAULT 1,
+            key TEXT NOT NULL,
+            value TEXT,
+            PRIMARY KEY (user_id, key)
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weight_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL DEFAULT 1,
+            date TEXT NOT NULL,
             weight_kg REAL NOT NULL,
             note TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, date)
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS water_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 1,
             date TEXT NOT NULL,
             amount_ml REAL NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Миграции старых баз без user_id
+    for table, cols in [
+        ("meals", "user_id INTEGER NOT NULL DEFAULT 1"),
+        ("favorites", "user_id INTEGER NOT NULL DEFAULT 1"),
+        ("water_log", "user_id INTEGER NOT NULL DEFAULT 1"),
+        ("weight_log", "user_id INTEGER NOT NULL DEFAULT 1"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {cols}")
+        except sqlite3.OperationalError:
+            pass
+    try:
+        cur.execute("ALTER TABLE meals ADD COLUMN meal_type TEXT DEFAULT 'other'")
+    except sqlite3.OperationalError:
+        pass
+
+    # Старые settings без user_id → перенос
+    try:
+        cur.execute("SELECT key, value FROM settings LIMIT 1")
+        # если есть колонка user_id — ок; если старый формат key PRIMARY KEY
+    except sqlite3.OperationalError:
+        pass
+    # если старая settings только (key, value)
+    cur.execute("PRAGMA table_info(settings)")
+    scols = [r[1] for r in cur.fetchall()]
+    if "user_id" not in scols and "key" in scols:
+        cur.execute("SELECT key, value FROM settings")
+        old = cur.fetchall()
+        cur.execute("DROP TABLE settings")
+        cur.execute("""
+            CREATE TABLE settings (
+                user_id INTEGER NOT NULL DEFAULT 1,
+                key TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (user_id, key)
+            )
+        """)
+        for k, v in old:
+            cur.execute("INSERT OR IGNORE INTO settings (user_id, key, value) VALUES (1, ?, ?)", (k, v))
+
     conn.commit()
     conn.close()
 
 
-def add_weight(weight_kg, log_date=None, note=None):
+def list_users():
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT id, name FROM users ORDER BY id", conn)
+    conn.close()
+    return df
+
+
+def create_user(name, pin=None):
+    name = (name or "").strip()
+    if not name:
+        return None, "Введите имя"
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO users (name, pin) VALUES (?, ?)", (name, pin or None))
+        conn.commit()
+        uid = cur.lastrowid
+        conn.close()
+        return uid, None
+    except sqlite3.IntegrityError:
+        conn.close()
+        return None, "Такое имя уже есть"
+
+
+def get_user_name(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else "?"
+
+
+def check_user_pin(user_id, pin):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT pin FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    stored = row[0]
+    if not stored:
+        return True  # пин не задан
+    return str(stored) == str(pin or "")
+
+
+def add_weight(user_id, weight_kg, log_date=None, note=None):
     if log_date is None:
         log_date = date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO weight_log (date, weight_kg, note) VALUES (?, ?, ?)
-           ON CONFLICT(date) DO UPDATE SET weight_kg = excluded.weight_kg, note = excluded.note""",
-        (log_date, weight_kg, note)
+        """INSERT INTO weight_log (user_id, date, weight_kg, note) VALUES (?, ?, ?, ?)
+           ON CONFLICT(user_id, date) DO UPDATE SET weight_kg = excluded.weight_kg, note = excluded.note""",
+        (user_id, log_date, weight_kg, note)
     )
     conn.commit()
     conn.close()
 
 
-def get_latest_weight():
+def get_latest_weight(user_id):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT weight_kg, date FROM weight_log ORDER BY date DESC LIMIT 1")
+    cur.execute(
+        "SELECT weight_kg, date FROM weight_log WHERE user_id = ? ORDER BY date DESC LIMIT 1",
+        (user_id,)
+    )
     row = cur.fetchone()
     conn.close()
     return (row[0], row[1]) if row else (None, None)
 
 
-def get_weight_history(days=90):
+def get_weight_history(user_id, days=90):
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT date, weight_kg, note FROM weight_log
-           ORDER BY date DESC LIMIT ?""",
-        conn, params=(days,)
+           WHERE user_id = ? ORDER BY date DESC LIMIT ?""",
+        conn, params=(user_id, days,)
     )
     conn.close()
     return df
 
 
-def delete_weight(log_date):
+def delete_weight(user_id, log_date):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM weight_log WHERE date = ?", (log_date,))
+    cur.execute("DELETE FROM weight_log WHERE user_id = ? AND date = ?", (user_id, log_date))
     conn.commit()
     conn.close()
 
 
-def add_water(amount_ml, log_date=None):
+def add_water(user_id, amount_ml, log_date=None):
     if log_date is None:
         log_date = date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO water_log (date, amount_ml) VALUES (?, ?)",
-        (log_date, amount_ml)
+        "INSERT INTO water_log (user_id, date, amount_ml) VALUES (?, ?, ?)",
+        (user_id, log_date, amount_ml)
     )
     conn.commit()
     conn.close()
 
 
-def get_water_today(for_date=None):
+def get_water_today(user_id, for_date=None):
     if for_date is None:
         for_date = date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT COALESCE(SUM(amount_ml), 0) FROM water_log WHERE date = ?",
-        (for_date,)
+        "SELECT COALESCE(SUM(amount_ml), 0) FROM water_log WHERE user_id = ? AND date = ?",
+        (user_id, for_date,)
     )
     total = cur.fetchone()[0]
     conn.close()
     return float(total or 0)
 
 
-def get_water_entries(for_date=None):
+def get_water_entries(user_id, for_date=None):
     if for_date is None:
         for_date = date.today().isoformat()
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT id, amount_ml, created_at FROM water_log
-           WHERE date = ? ORDER BY created_at DESC""",
-        conn, params=(for_date,)
+           WHERE user_id = ? AND date = ? ORDER BY created_at DESC""",
+        conn, params=(user_id, for_date,)
     )
     conn.close()
     return df
@@ -350,17 +456,21 @@ def import_meals_csv(df: pd.DataFrame, mode="append"):
     conn = get_conn()
     cur = conn.cursor()
 
+    # user_id передаётся через df.attrs или глобально — см. вызов import_meals_csv(user_id=...)
+    user_id = getattr(df, "attrs", {}).get("user_id", 1)
+
     if mode == "replace_dates":
         dates = df["date"].unique().tolist()
         for d in dates:
-            cur.execute("DELETE FROM meals WHERE date = ?", (d,))
+            cur.execute("DELETE FROM meals WHERE user_id = ? AND date = ?", (user_id, d))
 
     count = 0
     for _, row in df.iterrows():
         cur.execute(
-            """INSERT INTO meals (date, product_name, barcode, amount_g, calories, proteins, fats, carbs, meal_type)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO meals (user_id, date, product_name, barcode, amount_g, calories, proteins, fats, carbs, meal_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
+                user_id,
                 row["date"],
                 str(row["product_name"]).strip(),
                 None,
@@ -377,6 +487,12 @@ def import_meals_csv(df: pd.DataFrame, mode="append"):
     conn.commit()
     conn.close()
     return count, None
+
+
+def import_meals_for_user(user_id, df, mode="append"):
+    df = df.copy()
+    df.attrs["user_id"] = user_id
+    return import_meals_csv(df, mode=mode)
 
 
 def calc_goals_from_weight(weight_kg, height_cm=None, age=None, sex="male", activity="moderate", goal="maintain"):
@@ -438,35 +554,36 @@ def calc_goals_from_weight(weight_kg, height_cm=None, age=None, sex="male", acti
     }
 
 
-def get_setting(key, default=None):
+def get_setting(user_id, key, default=None):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    cur.execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else default
 
 
-def set_setting(key, value):
+def set_setting(user_id, key, value):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, str(value))
+        """INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?)
+           ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value""",
+        (user_id, key, str(value))
     )
     conn.commit()
     conn.close()
 
 
-def add_meal(product_name, barcode, amount_g, cal, prot, fat, carb, meal_date=None, meal_type="other"):
+def add_meal(user_id, product_name, barcode, amount_g, cal, prot, fat, carb, meal_date=None, meal_type="other"):
     if meal_date is None:
         meal_date = date.today().isoformat()
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO meals (date, product_name, barcode, amount_g, calories, proteins, fats, carbs, meal_type)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (meal_date, product_name, barcode, amount_g, cal, prot, fat, carb, meal_type)
+        """INSERT INTO meals (user_id, date, product_name, barcode, amount_g, calories, proteins, fats, carbs, meal_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, meal_date, product_name, barcode, amount_g, cal, prot, fat, carb, meal_type)
     )
     conn.commit()
     conn.close()
@@ -501,13 +618,13 @@ def update_meal_type(meal_id, meal_type):
     conn.close()
 
 
-def get_meals(for_date=None):
+def get_meals(user_id, for_date=None):
     if for_date is None:
         for_date = date.today().isoformat()
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT id, product_name, amount_g, calories, proteins, fats, carbs, meal_type, created_at
-           FROM meals WHERE date = ? ORDER BY
+           FROM meals WHERE user_id = ? AND date = ? ORDER BY
              CASE meal_type
                WHEN 'breakfast' THEN 1
                WHEN 'lunch' THEN 2
@@ -515,13 +632,13 @@ def get_meals(for_date=None):
                WHEN 'snack' THEN 4
                ELSE 5
              END, created_at""",
-        conn, params=(for_date,)
+        conn, params=(user_id, for_date,)
     )
     conn.close()
     return df
 
 
-def get_summary(for_date=None):
+def get_summary(user_id, for_date=None):
     if for_date is None:
         for_date = date.today().isoformat()
     conn = get_conn()
@@ -529,8 +646,8 @@ def get_summary(for_date=None):
     cur.execute(
         """SELECT COALESCE(SUM(calories),0), COALESCE(SUM(proteins),0),
                   COALESCE(SUM(fats),0), COALESCE(SUM(carbs),0), COUNT(*)
-           FROM meals WHERE date = ?""",
-        (for_date,)
+           FROM meals WHERE user_id = ? AND date = ?""",
+        (user_id, for_date,)
     )
     row = cur.fetchone()
     conn.close()
@@ -550,7 +667,7 @@ def delete_meal(meal_id):
     return deleted
 
 
-def get_history(days=14):
+def get_history(user_id, days=14):
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT date,
@@ -559,20 +676,23 @@ def get_history(days=14):
                   ROUND(SUM(fats), 1) as fats,
                   ROUND(SUM(carbs), 1) as carbs,
                   COUNT(*) as meals
-           FROM meals
+           FROM meals WHERE user_id = ?
            GROUP BY date
            ORDER BY date DESC
            LIMIT ?""",
-        conn, params=(days,)
+        conn, params=(user_id, days,)
     )
     conn.close()
     return df
 
 
-def add_or_update_favorite(name, barcode, cal100, prot100, fat100, carb100, amount):
+def add_or_update_favorite(user_id, name, barcode, cal100, prot100, fat100, carb100, amount):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, times_used FROM favorites WHERE product_name = ?", (name,))
+    cur.execute(
+        "SELECT id, times_used FROM favorites WHERE user_id = ? AND product_name = ?",
+        (user_id, name),
+    )
     row = cur.fetchone()
     if row:
         cur.execute(
@@ -583,27 +703,26 @@ def add_or_update_favorite(name, barcode, cal100, prot100, fat100, carb100, amou
         )
     else:
         cur.execute(
-            """INSERT INTO favorites (product_name, barcode, calories_100g, proteins_100g,
-               fats_100g, carbs_100g, last_amount) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (name, barcode, cal100, prot100, fat100, carb100, amount)
+            """INSERT INTO favorites (user_id, product_name, barcode, calories_100g, proteins_100g,
+               fats_100g, carbs_100g, last_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, name, barcode, cal100, prot100, fat100, carb100, amount)
         )
     conn.commit()
     conn.close()
 
 
-def get_favorites(limit=12):
+def get_favorites(user_id, limit=12):
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT product_name, barcode, calories_100g, proteins_100g, fats_100g, carbs_100g, last_amount, times_used
-           FROM favorites ORDER BY times_used DESC, product_name LIMIT ?""",
-        conn, params=(limit,)
+           FROM favorites WHERE user_id = ? ORDER BY times_used DESC, product_name LIMIT ?""",
+        conn, params=(user_id, limit,)
     )
     conn.close()
     return df
 
 
-def get_recent_products(limit=8):
-    """Уникальные продукты за последние 7 дней"""
+def get_recent_products(user_id, limit=8):
     conn = get_conn()
     df = pd.read_sql_query(
         """SELECT product_name,
@@ -614,20 +733,20 @@ def get_recent_products(limit=8):
                   ROUND(AVG(carbs * 100.0 / NULLIF(amount_g, 0)), 1) as carb100,
                   COUNT(*) as cnt
            FROM meals
-           WHERE date >= date('now', '-7 days')
+           WHERE user_id = ? AND date >= date('now', '-7 days')
            GROUP BY product_name
            ORDER BY MAX(created_at) DESC
            LIMIT ?""",
-        conn, params=(limit,)
+        conn, params=(user_id, limit,)
     )
     conn.close()
     return df
 
 
-def remove_favorite(name):
+def remove_favorite(user_id, name):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM favorites WHERE product_name = ?", (name,))
+    cur.execute("DELETE FROM favorites WHERE user_id = ? AND product_name = ?", (user_id, name))
     conn.commit()
     conn.close()
 
@@ -790,15 +909,118 @@ def extract_nutrients(product):
 
 
 # ==================== UI ====================
+def show_login_screen():
+    """Экран входа / регистрации — друг видит пустой старт и создаёт свой аккаунт."""
+    st.markdown('<p class="main-header">Трекер питания</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-header">Войдите или создайте свой аккаунт</p>', unsafe_allow_html=True)
+
+    users_df = list_users()
+    tab_login, tab_reg = st.tabs(["🔑 Войти", "✨ Создать аккаунт"])
+
+    with tab_reg:
+        st.markdown("#### Новый аккаунт")
+        st.caption("Свой дневник, вес и цели — никто другой их не изменит")
+        reg_name = st.text_input("Имя / ник", key="reg_name", placeholder="Например: Маша")
+        reg_pin = st.text_input("Пин-код (рекомендуется)", type="password", key="reg_pin",
+                               placeholder="4+ цифры или буквы")
+        reg_pin2 = st.text_input("Повторите пин", type="password", key="reg_pin2")
+        if st.button("Зарегистрироваться", type="primary", use_container_width=True, key="btn_reg"):
+            if not reg_name or not reg_name.strip():
+                st.error("Введите имя")
+            elif reg_pin and reg_pin != reg_pin2:
+                st.error("Пины не совпадают")
+            else:
+                nid, err = create_user(reg_name.strip(), reg_pin or None)
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.logged_in = True
+                    st.session_state.my_user_id = nid
+                    st.session_state.view_user_id = nid
+                    st.success(f"Аккаунт «{reg_name.strip()}» создан!")
+                    time.sleep(0.6)
+                    st.rerun()
+
+    with tab_login:
+        st.markdown("#### Вход")
+        if users_df.empty:
+            st.info("Пока нет аккаунтов. Создайте первый во вкладке «Создать аккаунт».")
+        else:
+            user_ids = users_df["id"].tolist()
+            user_names = {int(r["id"]): r["name"] for _, r in users_df.iterrows()}
+            login_uid = st.selectbox(
+                "Аккаунт",
+                options=user_ids,
+                format_func=lambda x: user_names.get(x, str(x)),
+                key="login_uid",
+            )
+            login_pin = st.text_input("Пин-код", type="password", key="login_pin",
+                                      placeholder="Если пин не задавали — оставьте пустым")
+            if st.button("Войти", type="primary", use_container_width=True, key="btn_login"):
+                if check_user_pin(int(login_uid), login_pin):
+                    st.session_state.logged_in = True
+                    st.session_state.my_user_id = int(login_uid)
+                    st.session_state.view_user_id = int(login_uid)
+                    st.rerun()
+                else:
+                    st.error("Неверный пин-код")
+
+
 def main():
     init_db()
+
+    # ---- Не вошёл → только вход / регистрация ----
+    if not st.session_state.get("logged_in"):
+        show_login_screen()
+        return
+
+    users_df = list_users()
+    user_ids = users_df["id"].tolist() if not users_df.empty else []
+    user_names = {int(r["id"]): r["name"] for _, r in users_df.iterrows()} if not users_df.empty else {}
+
+    if st.session_state.my_user_id not in user_ids:
+        st.session_state.logged_in = False
+        st.rerun()
+        return
+
+    if "view_user_id" not in st.session_state or st.session_state.view_user_id not in user_ids:
+        st.session_state.view_user_id = st.session_state.my_user_id
 
     # ---- Sidebar ----
     with st.sidebar:
         st.markdown("### 🍎 Трекер питания")
-        st.caption("Данные хранятся локально")
-        st.divider()
+        my_name = user_names.get(st.session_state.my_user_id, "?")
+        st.caption(f"Вы вошли как **{my_name}**")
+        if st.button("🚪 Выйти", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.pop("my_user_id", None)
+            st.session_state.pop("view_user_id", None)
+            st.rerun()
 
+        st.divider()
+        st.markdown("#### 👁 Чей дневник смотрю")
+        view_idx = user_ids.index(st.session_state.view_user_id) if st.session_state.view_user_id in user_ids else 0
+        view_uid = st.selectbox(
+            "Профиль",
+            options=user_ids,
+            index=view_idx,
+            format_func=lambda x: (
+                f"{user_names.get(x, x)} (я)" if x == st.session_state.my_user_id
+                else f"{user_names.get(x, x)} — только просмотр"
+            ),
+            key="sel_view_user",
+        )
+        st.session_state.view_user_id = int(view_uid)
+
+        can_edit = st.session_state.my_user_id == st.session_state.view_user_id
+        uid = st.session_state.view_user_id
+
+        if can_edit:
+            st.success("✏️ Ваш дневник — можно редактировать")
+        else:
+            st.warning(f"👁 Смотрите **{user_names.get(uid, '')}** — менять нельзя")
+
+        st.divider()
         page = st.radio(
             "Навигация",
             ["🏠 Сегодня", "🔍 Поиск продуктов", "➕ Свой продукт", "📅 История", "⚖️ Вес", "🗂 База продуктов"],
@@ -811,12 +1033,12 @@ def main():
             "Куда добавлять",
             options=list(MEAL_TYPES.keys()),
             format_func=lambda x: MEAL_TYPES[x],
-            key="current_meal_type"
+            key="current_meal_type",
+            disabled=not can_edit,
         )
 
         st.divider()
-        # Текущий вес
-        latest_w, latest_w_date = get_latest_weight()
+        latest_w, latest_w_date = get_latest_weight(uid)
         if latest_w:
             st.markdown(f"#### ⚖️ Вес: **{latest_w:.1f} кг**")
             st.caption(f"от {latest_w_date}")
@@ -826,10 +1048,10 @@ def main():
 
         st.divider()
         st.markdown("#### Цели на день")
-        saved_cal = int(float(get_setting("goal_cal", 2000)))
-        saved_prot = int(float(get_setting("goal_prot", 120)))
-        saved_fat = int(float(get_setting("goal_fat", 70)))
-        saved_carb = int(float(get_setting("goal_carb", 250)))
+        saved_cal = int(float(get_setting(uid, "goal_cal", 2000)))
+        saved_prot = int(float(get_setting(uid, "goal_prot", 120)))
+        saved_fat = int(float(get_setting(uid, "goal_fat", 70)))
+        saved_carb = int(float(get_setting(uid, "goal_carb", 250)))
 
         goal_cal = st.number_input("Калории", min_value=0, value=saved_cal, step=50, key="g_cal")
         goal_prot = st.number_input("Белки (г)", min_value=0, value=saved_prot, step=5, key="g_prot")
@@ -837,18 +1059,18 @@ def main():
         goal_carb = st.number_input("Углеводы (г)", min_value=0, value=saved_carb, step=10, key="g_carb")
 
         if st.button("💾 Сохранить цели", use_container_width=True):
-            set_setting("goal_cal", goal_cal)
-            set_setting("goal_prot", goal_prot)
-            set_setting("goal_fat", goal_fat)
-            set_setting("goal_carb", goal_carb)
+            set_setting(uid, "goal_cal", goal_cal)
+            set_setting(uid, "goal_prot", goal_prot)
+            set_setting(uid, "goal_fat", goal_fat)
+            set_setting(uid, "goal_carb", goal_carb)
             st.toast("Цели сохранены", icon="💾")
 
         # Подсказка целей по весу
         if latest_w:
             with st.expander("📐 Рассчитать цели по весу"):
                 sex = st.selectbox("Пол", ["male", "female"], format_func=lambda x: "Мужской" if x == "male" else "Женский", key="calc_sex")
-                height = st.number_input("Рост (см)", min_value=100, max_value=250, value=int(float(get_setting("height_cm", 175))), key="calc_h")
-                age = st.number_input("Возраст", min_value=14, max_value=100, value=int(float(get_setting("age", 30))), key="calc_age")
+                height = st.number_input("Рост (см)", min_value=100, max_value=250, value=int(float(get_setting(uid, "height_cm", 175))), key="calc_h")
+                age = st.number_input("Возраст", min_value=14, max_value=100, value=int(float(get_setting(uid, "age", 30))), key="calc_age")
                 activity = st.selectbox(
                     "Активность",
                     ["sedentary", "light", "moderate", "active", "very_active"],
@@ -870,17 +1092,17 @@ def main():
                     key="calc_goal"
                 )
                 if st.button("Рассчитать и применить", use_container_width=True):
-                    set_setting("height_cm", height)
-                    set_setting("age", age)
-                    set_setting("sex", sex)
-                    set_setting("activity", activity)
+                    set_setting(uid, "height_cm", height)
+                    set_setting(uid, "age", age)
+                    set_setting(uid, "sex", sex)
+                    set_setting(uid, "activity", activity)
                     res = calc_goals_from_weight(latest_w, height, age, sex, activity, goal_type)
                     if res:
-                        set_setting("goal_cal", res["calories"])
-                        set_setting("goal_prot", res["proteins"])
-                        set_setting("goal_fat", res["fats"])
-                        set_setting("goal_carb", res["carbs"])
-                        set_setting("tdee", res["tdee"])
+                        set_setting(uid, "goal_cal", res["calories"])
+                        set_setting(uid, "goal_prot", res["proteins"])
+                        set_setting(uid, "goal_fat", res["fats"])
+                        set_setting(uid, "goal_carb", res["carbs"])
+                        set_setting(uid, "tdee", res["tdee"])
                         st.success(f"Цели: {res['calories']} ккал · Б {res['proteins']} · Ж {res['fats']} · У {res['carbs']}")
                         st.caption(f"BMR ≈ {res['bmr']} · расход на поддержание (TDEE) ≈ {res['tdee']}")
                         time.sleep(0.8)
@@ -924,7 +1146,10 @@ def main():
     # ---- Header ----
     st.markdown('<p class="main-header">Трекер питания</p>', unsafe_allow_html=True)
     day_label = "сегодня" if is_today else ("завтра" if selected == date.today() + timedelta(days=1) else selected.strftime("%d.%m.%Y"))
-    st.markdown(f'<p class="sub-header">День: {selected.strftime("%d %B %Y")} ({day_label})</p>', unsafe_allow_html=True)
+    profile_line = f"Профиль: **{user_names.get(uid, '')}**"
+    if not can_edit:
+        profile_line += " · 👁 только просмотр"
+    st.markdown(f'<p class="sub-header">{profile_line} · {selected.strftime("%d %B %Y")} ({day_label})</p>', unsafe_allow_html=True)
 
     # ==================== СТРАНИЦА: СЕГОДНЯ ====================
     if page == "🏠 Сегодня":
@@ -980,8 +1205,8 @@ def main():
         elif is_past:
             st.caption("Редактирование прошлого дня")
 
-        summary = get_summary(selected_str)
-        meals_df = get_meals(selected_str)
+        summary = get_summary(uid, selected_str)
+        meals_df = get_meals(uid, selected_str)
 
         # Метрики — 2 ряда по 2 (удобно на телефоне)
         col1, col2 = st.columns(2)
@@ -1004,10 +1229,10 @@ def main():
         eaten = summary["calories"]
 
         # TDEE (сколько примерно сжигает тело за день) — из профиля или от веса
-        height_s = get_setting("height_cm")
-        age_s = get_setting("age")
-        sex_s = get_setting("sex", "male")
-        act_s = get_setting("activity", "moderate")
+        height_s = get_setting(uid, "height_cm")
+        age_s = get_setting(uid, "age")
+        sex_s = get_setting(uid, "sex", "male")
+        act_s = get_setting(uid, "activity", "moderate")
         tdee = None
         if latest_w:
             res_m = calc_goals_from_weight(
@@ -1073,8 +1298,8 @@ def main():
 
         # ---- Вода ----
         st.markdown("#### 💧 Вода")
-        water_today = get_water_today(selected_str)
-        saved_water_goal = get_setting("water_goal_ml")
+        water_today = get_water_today(uid, selected_str)
+        saved_water_goal = get_setting(uid, "water_goal_ml")
         if saved_water_goal:
             water_goal = int(float(saved_water_goal))
         elif latest_w:
@@ -1087,40 +1312,46 @@ def main():
         if latest_w and not saved_water_goal:
             st.caption(f"Норма ≈ 35 мл/кг × {latest_w:.1f} кг = {water_goal} мл")
 
-        wb1, wb2, wb3 = st.columns(3)
-        with wb1:
-            if st.button("+200 мл", key="water_200", use_container_width=True):
-                add_water(200, selected_str)
-                st.toast("+200 мл", icon="💧")
+        if can_edit:
+            wb1, wb2, wb3 = st.columns(3)
+            with wb1:
+                if st.button("+200 мл", key="water_200", use_container_width=True):
+                    add_water(uid, 200, selected_str)
+                    st.toast("+200 мл", icon="💧")
+                    time.sleep(0.3)
+                    st.rerun()
+            with wb2:
+                if st.button("+250 мл", key="water_250", use_container_width=True):
+                    add_water(uid, 250, selected_str)
+                    st.toast("+250 мл", icon="💧")
+                    time.sleep(0.3)
+                    st.rerun()
+            with wb3:
+                if st.button("+500 мл", key="water_500", use_container_width=True):
+                    add_water(uid, 500, selected_str)
+                    st.toast("+500 мл", icon="💧")
+                    time.sleep(0.3)
+                    st.rerun()
+            if st.button("+1 литр", key="water_1000", use_container_width=True):
+                add_water(uid, 1000, selected_str)
+                st.toast("+1000 мл", icon="💧")
                 time.sleep(0.3)
                 st.rerun()
-        with wb2:
-            if st.button("+250 мл", key="water_250", use_container_width=True):
-                add_water(250, selected_str)
-                st.toast("+250 мл", icon="💧")
-                time.sleep(0.3)
-                st.rerun()
-        with wb3:
-            if st.button("+500 мл", key="water_500", use_container_width=True):
-                add_water(500, selected_str)
-                st.toast("+500 мл", icon="💧")
-                time.sleep(0.3)
-                st.rerun()
-        if st.button("+1 литр", key="water_1000", use_container_width=True):
-            add_water(1000, selected_str)
-            st.toast("+1000 мл", icon="💧")
-            time.sleep(0.3)
-            st.rerun()
+        else:
+            st.caption("Добавление воды недоступно в режиме просмотра")
 
         with st.expander("💧 Своё количество / записи"):
-            custom_ml = st.number_input("мл", min_value=50, max_value=2000, value=250, step=50, key="custom_water")
-            if st.button("Добавить", key="add_custom_water"):
-                add_water(custom_ml, selected_str)
-                st.toast(f"+{custom_ml} мл", icon="💧")
-                time.sleep(0.3)
-                st.rerun()
+            if can_edit:
+                custom_ml = st.number_input("мл", min_value=50, max_value=2000, value=250, step=50, key="custom_water")
+                if st.button("Добавить", key="add_custom_water"):
+                    add_water(uid, custom_ml, selected_str)
+                    st.toast(f"+{custom_ml} мл", icon="💧")
+                    time.sleep(0.3)
+                    st.rerun()
+            else:
+                st.caption("Только просмотр")
 
-            entries = get_water_entries(selected_str)
+            entries = get_water_entries(uid, selected_str)
             if not entries.empty:
                 st.caption("Записи за этот день:")
                 for _, e in entries.iterrows():
@@ -1139,7 +1370,7 @@ def main():
                 key="set_water_goal"
             )
             if st.button("Сохранить цель воды"):
-                set_setting("water_goal_ml", new_goal)
+                set_setting(uid, "water_goal_ml", new_goal)
                 st.toast("Цель воды сохранена")
                 time.sleep(0.3)
                 st.rerun()
@@ -1147,8 +1378,8 @@ def main():
         st.divider()
 
         # ---- Быстрое добавление: Избранное + Недавние ----
-        favs = get_favorites(10)
-        recent = get_recent_products(8)
+        favs = get_favorites(uid, 10)
+        recent = get_recent_products(uid, 8)
 
         if not favs.empty or not recent.empty:
             st.markdown("#### ⚡ Быстрое добавление")
@@ -1162,7 +1393,7 @@ def main():
                         amt = int(row["last_amount"] or 100)
                         if st.button(f"⭐ {label} · {amt}г", key=f"fav_{idx}", use_container_width=True):
                             factor = amt / 100.0
-                            add_meal(
+                            add_meal(uid, 
                                 row["product_name"], row["barcode"], amt,
                                 (row["calories_100g"] or 0) * factor,
                                 (row["proteins_100g"] or 0) * factor,
@@ -1171,7 +1402,7 @@ def main():
                                 meal_date=selected_str,
                                 meal_type=meal_type
                             )
-                            add_or_update_favorite(
+                            add_or_update_favorite(uid, 
                                 row["product_name"], row["barcode"],
                                 row["calories_100g"], row["proteins_100g"],
                                 row["fats_100g"], row["carbs_100g"], amt
@@ -1189,7 +1420,7 @@ def main():
                         amt = int(row["avg_amount"] or 100)
                         if st.button(f"🕐 {label} · {amt}г", key=f"rec_{idx}", use_container_width=True):
                             factor = amt / 100.0
-                            add_meal(
+                            add_meal(uid, 
                                 row["product_name"], None, amt,
                                 (row["cal100"] or 0) * factor,
                                 (row["prot100"] or 0) * factor,
@@ -1277,7 +1508,9 @@ def main():
     # ==================== СТРАНИЦА: ПОИСК ====================
     elif page == "🔍 Поиск продуктов":
         st.markdown("#### 🔍 Поиск продуктов в Open Food Facts")
-        st.caption(f"Добавление в день: **{selected.strftime('%d.%m.%Y')}** · смени день на вкладке «Сегодня»")
+        if not can_edit:
+            st.warning("👁 Чужой профиль — только просмотр. Чтобы писать данные, выберите себя в «Я (мой профиль)».")
+        st.caption(f"Добавление в день: **{selected.strftime('%d.%m.%Y')}**")
 
         # Инициализация session state для результатов поиска
         if "search_results" not in st.session_state:
@@ -1354,8 +1587,8 @@ def main():
                                     prot_v = (nutr["proteins"] or 0) * factor
                                     fat_v = (nutr["fats"] or 0) * factor
                                     carb_v = (nutr["carbs"] or 0) * factor
-                                    add_meal(full_name, code, qa, cal_v, prot_v, fat_v, carb_v, meal_date=selected_str, meal_type=meal_type)
-                                    add_or_update_favorite(
+                                    add_meal(uid, full_name, code, qa, cal_v, prot_v, fat_v, carb_v, meal_date=selected_str, meal_type=meal_type)
+                                    add_or_update_favorite(uid, 
                                         full_name, code,
                                         nutr["calories"], nutr["proteins"],
                                         nutr["fats"], nutr["carbs"], qa
@@ -1379,8 +1612,8 @@ def main():
                                 prot_v = (nutr["proteins"] or 0) * factor
                                 fat_v = (nutr["fats"] or 0) * factor
                                 carb_v = (nutr["carbs"] or 0) * factor
-                                add_meal(full_name, code, amount, cal_v, prot_v, fat_v, carb_v, meal_date=selected_str, meal_type=meal_type)
-                                add_or_update_favorite(
+                                add_meal(uid, full_name, code, amount, cal_v, prot_v, fat_v, carb_v, meal_date=selected_str, meal_type=meal_type)
+                                add_or_update_favorite(uid, 
                                     full_name, code,
                                     nutr["calories"], nutr["proteins"],
                                     nutr["fats"], nutr["carbs"], amount
@@ -1390,7 +1623,7 @@ def main():
                                 st.rerun()
                         with b2:
                             if st.button("⭐", key=f"star_{i}", use_container_width=True, help="В избранное"):
-                                add_or_update_favorite(
+                                add_or_update_favorite(uid, 
                                     full_name, code,
                                     nutr["calories"], nutr["proteins"],
                                     nutr["fats"], nutr["carbs"], amount
@@ -1427,14 +1660,14 @@ def main():
                     st.error("Укажите название")
                 else:
                     factor = amount / 100.0
-                    add_meal(
+                    add_meal(uid, 
                         name.strip(), None, amount,
                         cal100 * factor, prot100 * factor,
                         fat100 * factor, carb100 * factor,
                         meal_date=selected_str,
                         meal_type=meal_type
                     )
-                    add_or_update_favorite(
+                    add_or_update_favorite(uid, 
                         name.strip(), None, cal100, prot100, fat100, carb100, amount
                     )
                     st.success(f"✅ Добавлено {amount:.0f} г «{name}» — {cal100*factor:.0f} ккал → {MEAL_TYPES.get(meal_type, '')}")
@@ -1446,15 +1679,15 @@ def main():
         st.markdown("#### 📅 История питания")
         days = st.slider("Показать последних дней", 7, 60, 14)
 
-        hist = get_history(days)
+        hist = get_history(uid, days)
         if hist.empty:
             st.info("Пока нет данных.")
         else:
             # TDEE для баланса по дням
-            height_s = get_setting("height_cm")
-            age_s = get_setting("age")
-            sex_s = get_setting("sex", "male")
-            act_s = get_setting("activity", "moderate")
+            height_s = get_setting(uid, "height_cm")
+            age_s = get_setting(uid, "age")
+            sex_s = get_setting(uid, "sex", "male")
+            act_s = get_setting(uid, "activity", "moderate")
             tdee = None
             if latest_w:
                 res_m = calc_goals_from_weight(
@@ -1547,8 +1780,8 @@ def main():
             day_options = hist["date"].tolist()
             selected_day = st.selectbox("Выберите день", options=day_options)
             if selected_day:
-                day_meals = get_meals(selected_day)
-                day_sum = get_summary(selected_day)
+                day_meals = get_meals(uid, selected_day)
+                day_sum = get_summary(uid, selected_day)
                 st.markdown(f"**{selected_day}** · {day_sum['calories']:.0f} ккал · Б {day_sum['proteins']:.1f} · Ж {day_sum['fats']:.1f} · У {day_sum['carbs']:.1f}")
 
                 if day_meals.empty:
@@ -1566,8 +1799,8 @@ def main():
     elif page == "⚖️ Вес":
         st.markdown("#### ⚖️ Трекер веса")
 
-        latest_w, latest_w_date = get_latest_weight()
-        hist_w = get_weight_history(120)
+        latest_w, latest_w_date = get_latest_weight(uid)
+        hist_w = get_weight_history(uid, 120)
 
         # Текущий вес и изменение
         c1, c2, c3 = st.columns(3)
@@ -1612,7 +1845,7 @@ def main():
             st.write("")
             st.write("")
             if st.button("💾 Сохранить", type="primary", use_container_width=True):
-                add_weight(w_val, w_date.isoformat())
+                add_weight(uid, w_val, w_date.isoformat())
                 st.toast(f"Вес {w_val:.1f} кг сохранён", icon="⚖️")
                 time.sleep(0.4)
                 st.rerun()
@@ -1644,7 +1877,7 @@ def main():
         if latest_w:
             st.divider()
             st.markdown("##### С учётом веса")
-            today_sum = get_summary()
+            today_sum = get_summary(uid)
             prot_per_kg = today_sum["proteins"] / latest_w if latest_w else 0
             cal_per_kg = today_sum["calories"] / latest_w if latest_w else 0
             p1, p2 = st.columns(2)
@@ -1659,7 +1892,7 @@ def main():
 
         # --- Избранное ---
         with tab1:
-            favs = get_favorites(50)
+            favs = get_favorites(uid, 50)
             if favs.empty:
                 st.info("Избранное пусто. Добавляйте продукты через поиск — они появятся здесь автоматически.")
             else:
@@ -1674,7 +1907,7 @@ def main():
                         )
                     with c2:
                         if st.button("🗑", key=f"rmfav_{idx}", help="Убрать", use_container_width=True):
-                            remove_favorite(row["product_name"])
+                            remove_favorite(uid, row["product_name"])
                             st.toast("Удалено из избранного")
                             time.sleep(0.3)
                             st.rerun()
@@ -1692,7 +1925,7 @@ def main():
                     ncarb = st.number_input("Углеводы / 100г", value=float(frow["carbs_100g"] or 0), key="ef_carb")
                     namt = st.number_input("Последнее кол-во (г)", value=float(frow["last_amount"] or 100), key="ef_amt")
                     if st.button("Сохранить", key="save_fav_edit"):
-                        add_or_update_favorite(sel, frow["barcode"], nc, np_, nf, ncarb, namt)
+                        add_or_update_favorite(uid, sel, frow["barcode"], nc, np_, nf, ncarb, namt)
                         st.success("Обновлено")
                         time.sleep(0.4)
                         st.rerun()
@@ -1798,7 +2031,7 @@ def main():
                         st.dataframe(df_imp.head(10), use_container_width=True)
                         st.caption(f"Строк в файле: {len(df_imp)}")
                         if st.button("Импортировать", type="primary", key="do_import"):
-                            n, err = import_meals_csv(df_imp, mode=import_mode)
+                            n, err = import_meals_for_user(uid, df_imp, mode=import_mode)
                             if err:
                                 st.error(err)
                             else:
