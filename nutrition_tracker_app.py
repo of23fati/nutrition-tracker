@@ -873,14 +873,16 @@ def main():
                     set_setting("height_cm", height)
                     set_setting("age", age)
                     set_setting("sex", sex)
+                    set_setting("activity", activity)
                     res = calc_goals_from_weight(latest_w, height, age, sex, activity, goal_type)
                     if res:
                         set_setting("goal_cal", res["calories"])
                         set_setting("goal_prot", res["proteins"])
                         set_setting("goal_fat", res["fats"])
                         set_setting("goal_carb", res["carbs"])
+                        set_setting("tdee", res["tdee"])
                         st.success(f"Цели: {res['calories']} ккал · Б {res['proteins']} · Ж {res['fats']} · У {res['carbs']}")
-                        st.caption(f"BMR ≈ {res['bmr']} · TDEE ≈ {res['tdee']}")
+                        st.caption(f"BMR ≈ {res['bmr']} · расход на поддержание (TDEE) ≈ {res['tdee']}")
                         time.sleep(0.8)
                         st.rerun()
 
@@ -985,7 +987,7 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             delta_cal = summary['calories'] - goal_cal
-            st.metric("Калории", f"{summary['calories']:.0f}", f"{delta_cal:+.0f} к цели")
+            st.metric("Съедено", f"{summary['calories']:.0f} ккал", f"{delta_cal:+.0f} к цели")
             st.metric("Белки", f"{summary['proteins']:.1f} г", f"из {goal_prot} г")
         with col2:
             st.metric("Жиры", f"{summary['fats']:.1f} г", f"из {goal_fat} г")
@@ -997,7 +999,68 @@ def main():
         else:
             st.caption(f"Записей: {summary['count']}")
 
-        # Прогресс-бары
+        # ---- Баланс: поддержание / съедено / остаток ----
+        st.markdown("#### 🔥 Баланс калорий")
+        eaten = summary["calories"]
+
+        # TDEE (сколько примерно сжигает тело за день) — из профиля или от веса
+        height_s = get_setting("height_cm")
+        age_s = get_setting("age")
+        sex_s = get_setting("sex", "male")
+        act_s = get_setting("activity", "moderate")
+        tdee = None
+        if latest_w:
+            res_m = calc_goals_from_weight(
+                latest_w,
+                float(height_s) if height_s else None,
+                int(float(age_s)) if age_s else None,
+                sex_s or "male",
+                act_s or "moderate",
+                "maintain",
+            )
+            if res_m:
+                tdee = res_m["tdee"]
+
+        if tdee:
+            balance = tdee - eaten  # нужно для поддержания минус съедено
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                st.metric("Сжигание (TDEE)", f"{tdee} ккал", help="Оценка расхода на поддержание веса")
+            with b2:
+                st.metric("Съедено", f"{eaten:.0f} ккал")
+            with b3:
+                # плюс = ещё можно съесть до поддержания; минус = перебор относительно поддержания
+                st.metric(
+                    "Остаток",
+                    f"{balance:+.0f} ккал",
+                    help="TDEE − съедено. Плюс — ещё есть запас до поддержания, минус — выше поддержания",
+                )
+
+            # прогресс относительно поддержания
+            pct_tdee = min(eaten / tdee, 1.5) if tdee else 0
+            st.progress(min(pct_tdee, 1.0), text=f"От поддержания: {eaten:.0f} / {tdee} ккал ({eaten/tdee*100:.0f}%)")
+
+            if balance > 50:
+                st.caption(f"До поддержания веса можно ещё ≈ **{balance:.0f} ккал**")
+            elif balance < -50:
+                st.caption(f"Выше поддержания на ≈ **{abs(balance):.0f} ккал** (профицит)")
+            else:
+                st.caption("Около уровня поддержания веса")
+
+            # сравнение с личной целью (похудение/набор)
+            if goal_cal and abs(goal_cal - tdee) > 20:
+                to_goal = goal_cal - eaten
+                if to_goal > 0:
+                    st.caption(f"До **личной цели** ({goal_cal} ккал): ещё **{to_goal:.0f} ккал**")
+                else:
+                    st.caption(f"Личная цель ({goal_cal} ккал) превышена на **{abs(to_goal):.0f} ккал**")
+        else:
+            st.info("Укажи вес во вкладке «⚖️ Вес» — появится расход на поддержание и остаток (нужно − съедено).")
+            # без веса всё равно покажем относительно цели
+            to_goal = goal_cal - eaten
+            st.metric("До цели", f"{to_goal:+.0f} ккал", help="Цель − съедено")
+
+        # Прогресс-бары к личной цели
         st.markdown("#### Прогресс к цели")
         pct = min(summary["calories"] / goal_cal, 1.0) if goal_cal else 0
         st.progress(pct, text=f"Ккал {pct*100:.0f}%")
@@ -1381,30 +1444,103 @@ def main():
     # ==================== СТРАНИЦА: ИСТОРИЯ ====================
     elif page == "📅 История":
         st.markdown("#### 📅 История питания")
-        days = st.slider("Показать последних дней", 7, 30, 14)
+        days = st.slider("Показать последних дней", 7, 60, 14)
 
         hist = get_history(days)
         if hist.empty:
             st.info("Пока нет данных.")
         else:
-            st.markdown("##### Калории по дням")
-            chart_df = hist.copy().sort_values("date")
-            st.bar_chart(chart_df.set_index("date")["calories"], color="#10b981")
+            # TDEE для баланса по дням
+            height_s = get_setting("height_cm")
+            age_s = get_setting("age")
+            sex_s = get_setting("sex", "male")
+            act_s = get_setting("activity", "moderate")
+            tdee = None
+            if latest_w:
+                res_m = calc_goals_from_weight(
+                    latest_w,
+                    float(height_s) if height_s else None,
+                    int(float(age_s)) if age_s else None,
+                    sex_s or "male",
+                    act_s or "moderate",
+                    "maintain",
+                )
+                if res_m:
+                    tdee = res_m["tdee"]
 
-            st.markdown("##### Средние значения")
+            hist_bal = hist.copy().sort_values("date")
+            if tdee:
+                # Остаток = TDEE − съедено: плюс = дефицит (сожгли «в минус к еде»), минус = профицит (набор)
+                hist_bal["tdee"] = tdee
+                hist_bal["balance"] = tdee - hist_bal["calories"]
+                hist_bal["status"] = hist_bal["balance"].apply(
+                    lambda x: "дефицит" if x > 50 else ("профицит" if x < -50 else "баланс")
+                )
+
+                st.markdown("##### Баланс по дням (TDEE − съедено)")
+                st.caption(
+                    f"Расход на поддержание (TDEE) ≈ **{tdee} ккал/день**. "
+                    "Плюс = дефицит (ниже поддержания), минус = профицит (выше поддержания)."
+                )
+
+                # График остатка
+                bal_chart = hist_bal.set_index("date")[["balance"]]
+                st.bar_chart(bal_chart, color="#3b82f6")
+
+                # Сводка за период
+                total_def = hist_bal.loc[hist_bal["balance"] > 0, "balance"].sum()
+                total_sur = hist_bal.loc[hist_bal["balance"] < 0, "balance"].sum()  # отрицательное
+                net = hist_bal["balance"].sum()
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Σ дефицит", f"+{total_def:.0f} ккал", help="Сумма дней ниже поддержания")
+                s2.metric("Σ профицит", f"{total_sur:.0f} ккал", help="Сумма дней выше поддержания")
+                s3.metric("Итого за период", f"{net:+.0f} ккал", help="Общий баланс: плюс — в сумме дефицит")
+                s4.metric("Ср. съедено", f"{hist_bal['calories'].mean():.0f}")
+
+                st.markdown("##### Таблица по дням")
+                show = hist_bal[["date", "calories", "tdee", "balance", "status", "proteins", "fats", "carbs", "meals"]].copy()
+                show = show.rename(columns={
+                    "date": "Дата",
+                    "calories": "Съедено",
+                    "tdee": "Сжигание",
+                    "balance": "Остаток",
+                    "status": "Итог",
+                    "proteins": "Белки",
+                    "fats": "Жиры",
+                    "carbs": "Углеводы",
+                    "meals": "Записей",
+                })
+                show["Остаток"] = show["Остаток"].round(0).astype(int)
+                st.dataframe(show, use_container_width=True, hide_index=True)
+
+                # Список понятным языком
+                with st.expander("📋 По дням словами"):
+                    for _, row in hist_bal.sort_values("date", ascending=False).iterrows():
+                        bal = row["balance"]
+                        if bal > 50:
+                            st.write(f"**{row['date']}**: съедено {row['calories']:.0f} → дефицит **{bal:.0f} ккал** (ниже поддержания)")
+                        elif bal < -50:
+                            st.write(f"**{row['date']}**: съедено {row['calories']:.0f} → профицит **{abs(bal):.0f} ккал** (набор относительно поддержания)")
+                        else:
+                            st.write(f"**{row['date']}**: съедено {row['calories']:.0f} → около баланса")
+            else:
+                st.warning("Укажи вес во вкладке «⚖️ Вес» — тогда по каждому дню будет дефицит/профицит.")
+                st.markdown("##### Калории по дням")
+                chart_df = hist.copy().sort_values("date")
+                st.bar_chart(chart_df.set_index("date")["calories"], color="#10b981")
+                display = hist.copy().rename(columns={
+                    "date": "Дата", "calories": "Ккал", "proteins": "Белки (г)",
+                    "fats": "Жиры (г)", "carbs": "Углеводы (г)", "meals": "Записей"
+                })
+                st.dataframe(display, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.markdown("##### Средние БЖУ")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Ср. калории", f"{hist['calories'].mean():.0f}")
             m2.metric("Ср. белки", f"{hist['proteins'].mean():.1f} г")
             m3.metric("Ср. жиры", f"{hist['fats'].mean():.1f} г")
             m4.metric("Ср. углеводы", f"{hist['carbs'].mean():.1f} г")
-
-            st.divider()
-            st.markdown("##### Подробно по дням")
-            display = hist.copy().rename(columns={
-                "date": "Дата", "calories": "Ккал", "proteins": "Белки (г)",
-                "fats": "Жиры (г)", "carbs": "Углеводы (г)", "meals": "Записей"
-            })
-            st.dataframe(display, use_container_width=True, hide_index=True)
 
             # Клик по дню — детальный просмотр
             st.markdown("##### 🔎 Разобрать конкретный день")
