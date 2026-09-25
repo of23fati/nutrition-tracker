@@ -412,6 +412,27 @@ def list_users():
     return df
 
 
+def list_users_cached():
+    """Кэш списка пользователей в session — без запроса на каждый клик."""
+    now = _time.time()
+    if (
+        "users_df_cache" in st.session_state
+        and now - st.session_state.get("users_df_cache_t", 0) < 180
+    ):
+        return st.session_state.users_df_cache
+    df = list_users()
+    st.session_state.users_df_cache = df
+    st.session_state.users_df_cache_t = now
+    return df
+
+
+def invalidate_caches(user_id=None):
+    st.session_state.pop("users_df_cache", None)
+    st.session_state.pop("users_df_cache_t", None)
+    if user_id is not None:
+        st.session_state.pop(f"settings_map_{user_id}", None)
+
+
 def create_user(name, pin=None):
     name = (name or "").strip()
     if not name:
@@ -423,7 +444,6 @@ def create_user(name, pin=None):
         conn.commit()
         uid = cur.lastrowid
         conn.close()
-        maybe_sync_cloud(force=True)
         return uid, None
     except Exception as e:
         conn.close()
@@ -466,7 +486,7 @@ def create_session(user_id):
     )
     conn.commit()
     conn.close()
-    maybe_sync_cloud(force=True)
+    # без force sync — он давал +10–15 сек на вход
     return token
 
 
@@ -489,7 +509,6 @@ def destroy_session(token):
     cur.execute("DELETE FROM sessions WHERE token = ?", (str(token),))
     conn.commit()
     conn.close()
-    maybe_sync_cloud(force=True)
 
 
 def login_user(user_id):
@@ -499,6 +518,7 @@ def login_user(user_id):
     st.session_state.my_user_id = int(user_id)
     st.session_state.view_user_id = int(user_id)
     st.session_state.session_token = token
+    invalidate_caches()
     try:
         st.query_params["s"] = token
     except Exception:
@@ -506,7 +526,7 @@ def login_user(user_id):
 
 
 def try_restore_login():
-    """Восстановить вход из ?s= или session_state."""
+    """Восстановить вход из ?s= или session_state. Без лишнего запроса, если уже вошли."""
     if st.session_state.get("logged_in") and st.session_state.get("my_user_id"):
         return True
     token = None
@@ -518,14 +538,28 @@ def try_restore_login():
         token = st.session_state.get("session_token")
     if not token:
         return False
+    # один лёгкий SELECT только при F5
     uid = user_id_from_session(token)
     if uid:
         st.session_state.logged_in = True
         st.session_state.my_user_id = uid
-        st.session_state.view_user_id = st.session_state.get("view_user_id", uid)
+        if "view_user_id" not in st.session_state:
+            st.session_state.view_user_id = uid
         st.session_state.session_token = token
         return True
     return False
+
+
+def summary_from_meals(meals_df):
+    if meals_df is None or getattr(meals_df, "empty", True):
+        return {"calories": 0.0, "proteins": 0.0, "fats": 0.0, "carbs": 0.0, "count": 0}
+    return {
+        "calories": float(meals_df["calories"].fillna(0).sum()),
+        "proteins": float(meals_df["proteins"].fillna(0).sum()),
+        "fats": float(meals_df["fats"].fillna(0).sum()),
+        "carbs": float(meals_df["carbs"].fillna(0).sum()),
+        "count": int(len(meals_df)),
+    }
 
 
 def logout_user():
@@ -782,13 +816,23 @@ def calc_goals_from_weight(weight_kg, height_cm=None, age=None, sex="male", acti
     }
 
 
-def get_setting(user_id, key, default=None):
+def get_settings_map(user_id):
+    """Все настройки пользователя одним запросом + кэш."""
+    cache_key = f"settings_map_{user_id}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE user_id = ? AND key = ?", (user_id, key))
-    row = cur.fetchone()
+    cur.execute("SELECT key, value FROM settings WHERE user_id = ?", (user_id,))
+    m = {r[0]: r[1] for r in cur.fetchall()}
     conn.close()
-    return row[0] if row else default
+    st.session_state[cache_key] = m
+    return m
+
+
+def get_setting(user_id, key, default=None):
+    m = get_settings_map(user_id)
+    return m.get(key, default)
 
 
 def set_setting(user_id, key, value):
@@ -801,6 +845,11 @@ def set_setting(user_id, key, value):
     )
     conn.commit()
     conn.close()
+    # обновить кэш
+    cache_key = f"settings_map_{user_id}"
+    m = st.session_state.get(cache_key) or {}
+    m[key] = str(value)
+    st.session_state[cache_key] = m
 
 
 def add_meal(user_id, product_name, barcode, amount_g, cal, prot, fat, carb, meal_date=None, meal_type="other"):
@@ -1176,7 +1225,7 @@ def show_login_screen():
     st.markdown('<p class="main-header">Трекер питания</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">Войдите или создайте свой аккаунт</p>', unsafe_allow_html=True)
 
-    users_df = list_users()
+    users_df = list_users_cached()
     cloud = is_cloud_db()
     if cloud:
         st.success("☁️ Облачная база Turso подключена — данные сохраняются постоянно.")
@@ -1272,7 +1321,7 @@ def main():
         show_login_screen()
         return
 
-    users_df = list_users()
+    users_df = list_users_cached()
     user_ids = users_df["id"].tolist() if not users_df.empty else []
     user_names = {int(r["id"]): r["name"] for _, r in users_df.iterrows()} if not users_df.empty else {}
 
@@ -1516,8 +1565,8 @@ def main():
         elif is_past:
             st.caption("Редактирование прошлого дня")
 
-        summary = get_summary(uid, selected_str)
         meals_df = get_meals(uid, selected_str)
+        summary = summary_from_meals(meals_df)
 
         # Метрики — 2 ряда по 2 (удобно на телефоне)
         col1, col2 = st.columns(2)
