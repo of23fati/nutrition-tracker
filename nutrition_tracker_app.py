@@ -176,14 +176,15 @@ def get_conn():
     if url and token:
         try:
             import libsql
-            # Удалённая БД Turso (совместима с sqlite3 API)
+        except ImportError as e:
+            raise ImportError(
+                "Пакет libsql не установлен. В репозитории GitHub в requirements.txt "
+                "должна быть строка: libsql==0.1.11 — затем Redeploy на Streamlit Cloud."
+            ) from e
+        try:
             return libsql.connect(database=url, auth_token=token)
-        except ImportError:
-            st.error("Для облачной БД установите пакет: pip install libsql")
-            raise
         except Exception as e:
-            st.error(f"Не удалось подключиться к Turso: {e}")
-            raise
+            raise RuntimeError(f"Не удалось подключиться к Turso: {e}") from e
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -271,45 +272,55 @@ def init_db():
         )
     """)
 
-    # Миграции старых баз без user_id
-    for table, cols in [
-        ("meals", "user_id INTEGER NOT NULL DEFAULT 1"),
-        ("favorites", "user_id INTEGER NOT NULL DEFAULT 1"),
-        ("water_log", "user_id INTEGER NOT NULL DEFAULT 1"),
-        ("weight_log", "user_id INTEGER NOT NULL DEFAULT 1"),
-    ]:
+    def _table_columns(cursor, table_name):
+        """Список колонок таблицы (sqlite / libsql / Turso)."""
         try:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {cols}")
-        except sqlite3.OperationalError:
-            pass
-    try:
-        cur.execute("ALTER TABLE meals ADD COLUMN meal_type TEXT DEFAULT 'other'")
-    except sqlite3.OperationalError:
-        pass
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            rows = cursor.fetchall()
+            # PRAGMA: cid, name, type, ...
+            return [r[1] for r in rows] if rows else []
+        except Exception:
+            return []
 
-    # Старые settings без user_id → перенос
+    def _add_column_if_missing(cursor, table, col_name, col_def):
+        cols = _table_columns(cursor, table)
+        if col_name in cols:
+            return
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+        except Exception:
+            # колонка уже есть / Turso / старый sqlite — игнор
+            pass
+
+    # Миграции старых локальных баз (на Turso при первом запуске таблицы уже с user_id)
+    _add_column_if_missing(cur, "meals", "user_id", "user_id INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing(cur, "favorites", "user_id", "user_id INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing(cur, "water_log", "user_id", "user_id INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing(cur, "weight_log", "user_id", "user_id INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing(cur, "meals", "meal_type", "meal_type TEXT DEFAULT 'other'")
+
+    # Старые settings без user_id → перенос (только локальные древние БД)
     try:
-        cur.execute("SELECT key, value FROM settings LIMIT 1")
-        # если есть колонка user_id — ок; если старый формат key PRIMARY KEY
-    except sqlite3.OperationalError:
+        scols = _table_columns(cur, "settings")
+        if scols and "user_id" not in scols and "key" in scols:
+            cur.execute("SELECT key, value FROM settings")
+            old = cur.fetchall()
+            cur.execute("DROP TABLE settings")
+            cur.execute("""
+                CREATE TABLE settings (
+                    user_id INTEGER NOT NULL DEFAULT 1,
+                    key TEXT NOT NULL,
+                    value TEXT,
+                    PRIMARY KEY (user_id, key)
+                )
+            """)
+            for k, v in old:
+                cur.execute(
+                    "INSERT OR IGNORE INTO settings (user_id, key, value) VALUES (1, ?, ?)",
+                    (k, v),
+                )
+    except Exception:
         pass
-    # если старая settings только (key, value)
-    cur.execute("PRAGMA table_info(settings)")
-    scols = [r[1] for r in cur.fetchall()]
-    if "user_id" not in scols and "key" in scols:
-        cur.execute("SELECT key, value FROM settings")
-        old = cur.fetchall()
-        cur.execute("DROP TABLE settings")
-        cur.execute("""
-            CREATE TABLE settings (
-                user_id INTEGER NOT NULL DEFAULT 1,
-                key TEXT NOT NULL,
-                value TEXT,
-                PRIMARY KEY (user_id, key)
-            )
-        """)
-        for k, v in old:
-            cur.execute("INSERT OR IGNORE INTO settings (user_id, key, value) VALUES (1, ?, ?)", (k, v))
 
     conn.commit()
     conn.close()
