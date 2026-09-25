@@ -17,6 +17,36 @@ DB_PATH = Path(__file__).parent / "nutrition.db"
 USER_AGENT = "Mozilla/5.0 (compatible; NutritionTracker/2.1; +https://github.com/nutrition-tracker)"
 SEARCH_URL = "https://world.openfoodfacts.org/cgi/search.pl"
 
+
+def get_turso_config():
+    """
+    Облачная БД Turso (SQLite в облаке).
+    Streamlit secrets:
+      [turso]
+      url = "libsql://YOUR-DB.turso.io"
+      auth_token = "..."
+    или переменные TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
+    """
+    url = token = None
+    try:
+        if "turso" in st.secrets:
+            url = st.secrets["turso"].get("url") or st.secrets["turso"].get("database_url")
+            token = st.secrets["turso"].get("auth_token") or st.secrets["turso"].get("token")
+    except Exception:
+        pass
+    if not url or not token:
+        import os
+        url = url or os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")
+        token = token or os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN")
+    if url and token:
+        return str(url).strip(), str(token).strip()
+    return None, None
+
+
+def is_cloud_db():
+    url, token = get_turso_config()
+    return bool(url and token)
+
 st.set_page_config(
     page_title="Трекер питания",
     page_icon="🍎",
@@ -138,6 +168,22 @@ st.markdown("""
 
 # ==================== БАЗА ДАННЫХ ====================
 def get_conn():
+    """
+    Локально → nutrition.db
+    Если настроен Turso (secrets) → облачная SQLite, данные не пропадают на Streamlit Cloud.
+    """
+    url, token = get_turso_config()
+    if url and token:
+        try:
+            import libsql
+            # Удалённая БД Turso (совместима с sqlite3 API)
+            return libsql.connect(database=url, auth_token=token)
+        except ImportError:
+            st.error("Для облачной БД установите пакет: pip install libsql")
+            raise
+        except Exception as e:
+            st.error(f"Не удалось подключиться к Turso: {e}")
+            raise
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -908,6 +954,39 @@ def extract_nutrients(product):
     }
 
 
+# ==================== БЭКАП / ВОССТАНОВЛЕНИЕ ====================
+def get_db_bytes():
+    """Сырые байты файла базы (для скачивания бэкапа)."""
+    init_db()
+    if not DB_PATH.exists():
+        return None
+    # checkpoint чтобы WAL сбросил в основной файл
+    try:
+        conn = get_conn()
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+        conn.close()
+    except Exception:
+        pass
+    return DB_PATH.read_bytes()
+
+
+def restore_db_from_bytes(data: bytes):
+    """Полностью заменить nutrition.db из бэкапа."""
+    try:
+        for suffix in ("-wal", "-shm"):
+            p = Path(str(DB_PATH) + suffix)
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        DB_PATH.write_bytes(data)
+        init_db()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 # ==================== UI ====================
 def show_login_screen():
     """Экран входа / регистрации — друг видит пустой старт и создаёт свой аккаунт."""
@@ -915,7 +994,16 @@ def show_login_screen():
     st.markdown('<p class="sub-header">Войдите или создайте свой аккаунт</p>', unsafe_allow_html=True)
 
     users_df = list_users()
-    tab_login, tab_reg = st.tabs(["🔑 Войти", "✨ Создать аккаунт"])
+    cloud = is_cloud_db()
+    if cloud:
+        st.success("☁️ Облачная база Turso подключена — данные сохраняются постоянно.")
+    elif users_df.empty:
+        st.warning(
+            "⚠️ Аккаунтов нет. Без Turso на Streamlit Cloud база **стирается** после простоя. "
+            "Настройте облако (см. README) или восстановите бэкап `.db` ниже."
+        )
+
+    tab_login, tab_reg, tab_backup = st.tabs(["🔑 Войти", "✨ Создать аккаунт", "💾 Бэкап"])
 
     with tab_reg:
         st.markdown("#### Новый аккаунт")
@@ -944,7 +1032,7 @@ def show_login_screen():
     with tab_login:
         st.markdown("#### Вход")
         if users_df.empty:
-            st.info("Пока нет аккаунтов. Создайте первый во вкладке «Создать аккаунт».")
+            st.info("Нет аккаунтов. Восстановите бэкап или создайте новый аккаунт.")
         else:
             user_ids = users_df["id"].tolist()
             user_names = {int(r["id"]): r["name"] for _, r in users_df.iterrows()}
@@ -964,6 +1052,38 @@ def show_login_screen():
                     st.rerun()
                 else:
                     st.error("Неверный пин-код")
+
+    with tab_backup:
+        st.markdown("#### Восстановить данные из бэкапа")
+        st.caption(
+            "На Streamlit Cloud после простоя приложение перезапускается с **пустой** базой. "
+            "Загрузите ранее скачанный файл `nutrition_backup_….db` — вернутся все аккаунты и записи."
+        )
+        up = st.file_uploader("Файл бэкапа (.db)", type=["db", "sqlite", "sqlite3"], key="restore_db")
+        if up is not None:
+            if st.button("Восстановить базу", type="primary", use_container_width=True, key="btn_restore"):
+                ok, err = restore_db_from_bytes(up.read())
+                if ok:
+                    st.session_state.logged_in = False
+                    st.success("База восстановлена! Теперь войдите во вкладке «Войти».")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"Ошибка: {err}")
+
+        st.divider()
+        st.markdown("#### Скачать текущую базу (если ещё есть данные)")
+        db_bytes = get_db_bytes()
+        if db_bytes and not users_df.empty:
+            st.download_button(
+                "💾 Скачать nutrition_backup.db",
+                db_bytes,
+                file_name=f"nutrition_backup_{date.today().isoformat()}.db",
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Сейчас сохранять нечего — база пустая.")
 
 
 def main():
@@ -1109,12 +1229,24 @@ def main():
                         st.rerun()
 
         st.divider()
-        # Экспорт
-        if st.button("📥 Экспорт в CSV", use_container_width=True):
+        st.markdown("#### 💾 Бэкап")
+        st.caption("Streamlit Cloud стирает базу при «сне». Скачивайте бэкап!")
+        db_bytes = get_db_bytes()
+        if db_bytes:
+            st.download_button(
+                "💾 Скачать всю базу (.db)",
+                db_bytes,
+                file_name=f"nutrition_backup_{date.today().isoformat()}.db",
+                mime="application/octet-stream",
+                use_container_width=True,
+                key="sidebar_db_backup",
+            )
+        if st.button("📥 Экспорт еды в CSV", use_container_width=True):
             conn = get_conn()
             export_df = pd.read_sql_query(
-                "SELECT date, meal_type, product_name, amount_g, calories, proteins, fats, carbs FROM meals ORDER BY date DESC, created_at",
-                conn
+                """SELECT date, meal_type, product_name, amount_g, calories, proteins, fats, carbs
+                   FROM meals WHERE user_id = ? ORDER BY date DESC, created_at""",
+                conn, params=(uid,),
             )
             conn.close()
             if not export_df.empty:
@@ -1124,14 +1256,17 @@ def main():
                     csv,
                     file_name=f"nutrition_export_{date.today().isoformat()}.csv",
                     mime="text/csv",
-                    use_container_width=True
+                    use_container_width=True,
+                    key="sidebar_csv_dl",
                 )
             else:
                 st.caption("Пока нет данных для экспорта")
 
         st.divider()
-        st.caption("Open Food Facts + локальная база")
-        st.caption("v2.2")
+        if is_cloud_db():
+            st.caption("v2.4 · ☁️ Turso — данные в облаке")
+        else:
+            st.caption("v2.4 · локальная БД · на Cloud нужен Turso")
 
     # Выбранный день (для просмотра / планирования / правок)
     if "selected_date" not in st.session_state:
