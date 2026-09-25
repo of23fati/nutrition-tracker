@@ -167,24 +167,86 @@ st.markdown("""
 
 
 # ==================== БАЗА ДАННЫХ ====================
+# Кэш соединения и схема (Streamlit на каждый клик перезапускает скрипт —
+# без кэша каждый раз новый round-trip в Turso → тормоза)
+_DB_CONN = None
+_DB_INITED = False
+_TURSO_LOCAL = Path("/tmp/nutrition_turso_cache.db")
+
+
+class _ConnProxy:
+    """Прокси: close() не закрывает singleton; commit() синхронизирует с Turso."""
+
+    def __init__(self, conn, is_cloud=False):
+        self._conn = conn
+        self._is_cloud = is_cloud
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._conn.executemany(*args, **kwargs)
+
+    def commit(self):
+        self._conn.commit()
+        if self._is_cloud and hasattr(self._conn, "sync"):
+            try:
+                self._conn.sync()
+            except Exception:
+                pass
+
+    def close(self):
+        # не закрываем общий коннект — переиспользуем
+        return None
+
+    def sync(self):
+        if hasattr(self._conn, "sync"):
+            self._conn.sync()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def get_conn():
     """
     Локально → nutrition.db
-    Если настроен Turso (secrets) → облачная SQLite, данные не пропадают на Streamlit Cloud.
+    Turso → локальный кэш + sync (быстрые чтения, облако для постоянного хранения)
     """
+    global _DB_CONN
     url, token = get_turso_config()
+
     if url and token:
+        if _DB_CONN is not None:
+            return _ConnProxy(_DB_CONN, is_cloud=True)
         try:
             import libsql
         except ImportError as e:
             raise ImportError(
-                "Пакет libsql не установлен. В репозитории GitHub в requirements.txt "
-                "должна быть строка: libsql==0.1.11 — затем Redeploy на Streamlit Cloud."
+                "Пакет libsql не установлен. В requirements.txt: libsql==0.1.11, затем Redeploy."
             ) from e
         try:
-            return libsql.connect(database=url, auth_token=token)
-        except Exception as e:
-            raise RuntimeError(f"Не удалось подключиться к Turso: {e}") from e
+            # Встроенная реплика: читаем/пишем локально в /tmp, иногда синкаем в Turso
+            _DB_CONN = libsql.connect(
+                str(_TURSO_LOCAL),
+                sync_url=url,
+                auth_token=token,
+            )
+            try:
+                _DB_CONN.sync()
+            except Exception:
+                pass
+            return _ConnProxy(_DB_CONN, is_cloud=True)
+        except Exception:
+            # fallback: прямое облачное соединение (медленнее)
+            try:
+                _DB_CONN = libsql.connect(database=url, auth_token=token)
+                return _ConnProxy(_DB_CONN, is_cloud=True)
+            except Exception as e:
+                raise RuntimeError(f"Не удалось подключиться к Turso: {e}") from e
+
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
@@ -198,6 +260,15 @@ MEAL_TYPES = {
 
 
 def init_db():
+    """Создаёт таблицы один раз за жизнь процесса (не на каждый клик)."""
+    global _DB_INITED
+    if _DB_INITED:
+        return
+    _init_db_schema()
+    _DB_INITED = True
+
+
+def _init_db_schema():
     conn = get_conn()
     cur = conn.cursor()
 
