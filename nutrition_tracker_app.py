@@ -167,15 +167,16 @@ st.markdown("""
 
 
 # ==================== БАЗА ДАННЫХ ====================
-# Кэш соединения и схема (Streamlit на каждый клик перезапускает скрипт —
-# без кэша каждый раз новый round-trip в Turso → тормоза)
-_DB_CONN = None
+import secrets as _secrets
+import time as _time
+
 _DB_INITED = False
+_LAST_SYNC = 0.0
 _TURSO_LOCAL = Path("/tmp/nutrition_turso_cache.db")
 
 
 class _ConnProxy:
-    """Прокси: close() не закрывает singleton; commit() синхронизирует с Turso."""
+    """close() не закрывает кэш; commit() без sync на каждый чих (sync редко)."""
 
     def __init__(self, conn, is_cloud=False):
         self._conn = conn
@@ -192,14 +193,9 @@ class _ConnProxy:
 
     def commit(self):
         self._conn.commit()
-        if self._is_cloud and hasattr(self._conn, "sync"):
-            try:
-                self._conn.sync()
-            except Exception:
-                pass
+        # не sync здесь — это и тормозило каждый клик
 
     def close(self):
-        # не закрываем общий коннект — переиспользуем
         return None
 
     def sync(self):
@@ -210,44 +206,50 @@ class _ConnProxy:
         return getattr(self._conn, name)
 
 
-def get_conn():
-    """
-    Локально → nutrition.db
-    Turso → локальный кэш + sync (быстрые чтения, облако для постоянного хранения)
-    """
-    global _DB_CONN
+@st.cache_resource(show_spinner=False)
+def _open_db_connection():
+    """Одно соединение на весь воркер Streamlit (главное ускорение)."""
     url, token = get_turso_config()
-
     if url and token:
-        if _DB_CONN is not None:
-            return _ConnProxy(_DB_CONN, is_cloud=True)
+        import libsql
         try:
-            import libsql
-        except ImportError as e:
-            raise ImportError(
-                "Пакет libsql не установлен. В requirements.txt: libsql==0.1.11, затем Redeploy."
-            ) from e
-        try:
-            # Встроенная реплика: читаем/пишем локально в /tmp, иногда синкаем в Turso
-            _DB_CONN = libsql.connect(
+            conn = libsql.connect(
                 str(_TURSO_LOCAL),
                 sync_url=url,
                 auth_token=token,
             )
             try:
-                _DB_CONN.sync()
+                conn.sync()
             except Exception:
                 pass
-            return _ConnProxy(_DB_CONN, is_cloud=True)
+            return conn, True
         except Exception:
-            # fallback: прямое облачное соединение (медленнее)
-            try:
-                _DB_CONN = libsql.connect(database=url, auth_token=token)
-                return _ConnProxy(_DB_CONN, is_cloud=True)
-            except Exception as e:
-                raise RuntimeError(f"Не удалось подключиться к Turso: {e}") from e
+            conn = libsql.connect(database=url, auth_token=token)
+            return conn, True
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    return conn, False
 
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def get_conn():
+    conn, is_cloud = _open_db_connection()
+    return _ConnProxy(conn, is_cloud=is_cloud)
+
+
+def maybe_sync_cloud(force=False):
+    """Синк с Turso не чаще раза в 15 сек (или force после важных записей)."""
+    global _LAST_SYNC
+    if not is_cloud_db():
+        return
+    now = _time.time()
+    if not force and (now - _LAST_SYNC) < 15:
+        return
+    try:
+        raw, _ = _open_db_connection()
+        if hasattr(raw, "sync"):
+            raw.sync()
+        _LAST_SYNC = now
+    except Exception:
+        pass
 
 
 MEAL_TYPES = {
@@ -260,7 +262,7 @@ MEAL_TYPES = {
 
 
 def init_db():
-    """Создаёт таблицы один раз за жизнь процесса (не на каждый клик)."""
+    """Схема БД один раз на процесс."""
     global _DB_INITED
     if _DB_INITED:
         return
@@ -281,8 +283,14 @@ def _init_db_schema():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     # ---- Таблицы данных (с user_id) ----
-    # Пользователи создаются только через регистрацию (пустой старт для нового друга)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -415,10 +423,13 @@ def create_user(name, pin=None):
         conn.commit()
         uid = cur.lastrowid
         conn.close()
+        maybe_sync_cloud(force=True)
         return uid, None
-    except sqlite3.IntegrityError:
+    except Exception as e:
         conn.close()
-        return None, "Такое имя уже есть"
+        if "unique" in str(e).lower() or "integrity" in str(e).lower():
+            return None, "Такое имя уже есть"
+        return None, str(e)
 
 
 def get_user_name(user_id):
@@ -442,6 +453,95 @@ def check_user_pin(user_id, pin):
     if not stored:
         return True  # пин не задан
     return str(stored) == str(pin or "")
+
+
+def create_session(user_id):
+    """Токен сессии — чтобы после F5 не выкидывало."""
+    token = _secrets.token_urlsafe(24)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sessions (token, user_id) VALUES (?, ?)",
+        (token, int(user_id)),
+    )
+    conn.commit()
+    conn.close()
+    maybe_sync_cloud(force=True)
+    return token
+
+
+def user_id_from_session(token):
+    if not token:
+        return None
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM sessions WHERE token = ?", (str(token),))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+
+def destroy_session(token):
+    if not token:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE token = ?", (str(token),))
+    conn.commit()
+    conn.close()
+    maybe_sync_cloud(force=True)
+
+
+def login_user(user_id):
+    """Войти и запомнить в URL (?s=token), чтобы переживать перезагрузку."""
+    token = create_session(user_id)
+    st.session_state.logged_in = True
+    st.session_state.my_user_id = int(user_id)
+    st.session_state.view_user_id = int(user_id)
+    st.session_state.session_token = token
+    try:
+        st.query_params["s"] = token
+    except Exception:
+        pass
+
+
+def try_restore_login():
+    """Восстановить вход из ?s= или session_state."""
+    if st.session_state.get("logged_in") and st.session_state.get("my_user_id"):
+        return True
+    token = None
+    try:
+        token = st.query_params.get("s")
+    except Exception:
+        pass
+    if not token:
+        token = st.session_state.get("session_token")
+    if not token:
+        return False
+    uid = user_id_from_session(token)
+    if uid:
+        st.session_state.logged_in = True
+        st.session_state.my_user_id = uid
+        st.session_state.view_user_id = st.session_state.get("view_user_id", uid)
+        st.session_state.session_token = token
+        return True
+    return False
+
+
+def logout_user():
+    token = st.session_state.get("session_token")
+    try:
+        token = token or st.query_params.get("s")
+    except Exception:
+        pass
+    destroy_session(token)
+    for k in ("logged_in", "my_user_id", "view_user_id", "session_token"):
+        st.session_state.pop(k, None)
+    try:
+        if "s" in st.query_params:
+            del st.query_params["s"]
+    except Exception:
+        pass
 
 
 def add_weight(user_id, weight_kg, log_date=None, note=None):
@@ -715,6 +815,7 @@ def add_meal(user_id, product_name, barcode, amount_g, cal, prot, fat, carb, mea
     )
     conn.commit()
     conn.close()
+    maybe_sync_cloud(force=False)
 
 
 def update_meal_amount(meal_id, new_amount):
@@ -1104,11 +1205,7 @@ def show_login_screen():
                 if err:
                     st.error(err)
                 else:
-                    st.session_state.logged_in = True
-                    st.session_state.my_user_id = nid
-                    st.session_state.view_user_id = nid
-                    st.success(f"Аккаунт «{reg_name.strip()}» создан!")
-                    time.sleep(0.6)
+                    login_user(nid)
                     st.rerun()
 
     with tab_login:
@@ -1128,9 +1225,7 @@ def show_login_screen():
                                       placeholder="Если пин не задавали — оставьте пустым")
             if st.button("Войти", type="primary", use_container_width=True, key="btn_login"):
                 if check_user_pin(int(login_uid), login_pin):
-                    st.session_state.logged_in = True
-                    st.session_state.my_user_id = int(login_uid)
-                    st.session_state.view_user_id = int(login_uid)
+                    login_user(int(login_uid))
                     st.rerun()
                 else:
                     st.error("Неверный пин-код")
@@ -1170,6 +1265,7 @@ def show_login_screen():
 
 def main():
     init_db()
+    try_restore_login()
 
     # ---- Не вошёл → только вход / регистрация ----
     if not st.session_state.get("logged_in"):
@@ -1181,7 +1277,7 @@ def main():
     user_names = {int(r["id"]): r["name"] for _, r in users_df.iterrows()} if not users_df.empty else {}
 
     if st.session_state.my_user_id not in user_ids:
-        st.session_state.logged_in = False
+        logout_user()
         st.rerun()
         return
 
@@ -1194,9 +1290,7 @@ def main():
         my_name = user_names.get(st.session_state.my_user_id, "?")
         st.caption(f"Вы вошли как **{my_name}**")
         if st.button("🚪 Выйти", use_container_width=True):
-            st.session_state.logged_in = False
-            st.session_state.pop("my_user_id", None)
-            st.session_state.pop("view_user_id", None)
+            logout_user()
             st.rerun()
 
         st.divider()
